@@ -162,11 +162,10 @@ class DistributedModel:
         loss = tf.reduce_mean(losses)
         return loss
 
-    def predict_on_batch(self, minibatch):
-        microbatches = self._get_microbatches(minibatch)
+    def predict_on_batch(self, x):
+        microbatches = self._get_microbatches(x)
         predictions = []
-        for microbatch in microbatches:
-            x, _ = microbatch
+        for x in microbatches:
             if self.is_first_node():
                 y_pred = self._model(x)
                 self._comm.send(y_pred, dest=self._next_rank)
@@ -213,7 +212,7 @@ def main():
         if model.is_last_node():
             print(f'Epoch {i + 1}/{max_epoch}')
             progbar = tf.keras.utils.Progbar(n_train_minibatch, stateful_metrics=['loss'])
-        for idx, minibatch in enumerate(x_train):
+        for minibatch in x_train:
             loss = model.train_on_batch(minibatch)
             if model.is_last_node():
                 # noinspection PyUnboundLocalVariable
@@ -222,9 +221,9 @@ def main():
     if model.is_last_node():
         print('Testing')
         progbar = tf.keras.utils.Progbar(n_test_minibatch, stateful_metrics=['acc'])
-    for idx, minibatch in enumerate(x_test):
-        _, y_true = minibatch
-        y_pred = model.predict_on_batch(minibatch)
+    for minibatch in x_test:
+        x, y_true = minibatch
+        y_pred = model.predict_on_batch(x)
         accuracy.update_state(y_true, y_pred)
         if model.is_last_node():
             # noinspection PyUnboundLocalVariable
