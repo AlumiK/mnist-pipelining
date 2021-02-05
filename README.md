@@ -1,6 +1,6 @@
-# MNIST Pipeline Model Parallelism
+# MNIST Model Parallelism Using Pipelining
 
-MNIST pipeline model parallelism implemented with TensorFlow 2 and MPI for Python.
+MNIST model parallelism using pipelining implemented with TensorFlow 2 and MPI.
 
 ## Run
 
