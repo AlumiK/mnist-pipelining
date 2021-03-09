@@ -3,10 +3,10 @@ import tensorflow as tf
 
 from mpi4py import MPI
 from nkmpi4py import NKMPI
-from typing import Sequence, Dict, Optional
+from typing import Sequence, Tuple, Dict, Optional
 
 batch_size = 64
-max_epoch = 5
+max_epoch = 10
 
 
 # noinspection PyUnusedLocal
@@ -95,40 +95,80 @@ class Head(tf.keras.Model):
         }
 
 
-class PipelineModel:
+class CommEngine:
+    class Entry:
+
+        def __init__(self, comm):
+            self.comm = comm
+            self.size: int = comm.Get_size()
+            self.rank: int = comm.Get_rank()
+            self.first_rank: int = 0
+            self.last_rank: int = self.size - 1
+            self.prev_rank: int = self.rank - 1 if self.rank - 1 >= self.first_rank else MPI.PROC_NULL
+            self.next_rank: int = self.rank + 1 if self.rank + 1 <= self.last_rank else MPI.PROC_NULL
+            self.is_first: bool = self.rank == self.first_rank
+            self.is_last: bool = self.rank == self.last_rank
+
+    def __init__(self, comm, model_size: int, data_dims: Sequence):
+        size = comm.Get_size()
+        cart2d = comm.Create_cart(dims=[model_size, size // model_size], periods=[False, False], reorder=False)
+        remain_dims = [True, False]
+        model_comm = cart2d.Sub(remain_dims)
+        remain_dims = [False, True]
+        data_comm = cart2d.Sub(remain_dims)
+        data_comm = NKMPI.Comm(data_comm, new_dims=data_dims)
+        self.model = CommEngine.Entry(model_comm)
+        self.data = CommEngine.Entry(data_comm)
+
+    @property
+    def is_coordinator(self) -> bool:
+        return MPI.COMM_WORLD.Get_rank() == MPI.COMM_WORLD.Get_size() - 1
+
+
+class HyParModel:
 
     def __init__(self,
-                 data_comm,
-                 nkmpi_comm,
+                 comm_engine: CommEngine,
                  optimizer: tf.keras.optimizers.Optimizer,
                  loss_fn: tf.keras.losses.Loss,
                  configs: Optional[Dict] = None):
-        self._data_comm = data_comm
-        self._nkmpi_comm = nkmpi_comm
-        self._size = data_comm.Get_size()
-        self._rank = data_comm.Get_rank()
-        self._first_rank = 0
-        self._last_rank = self._size - 1
-        self._next_rank = self._rank + 1 if self._rank + 1 <= self._last_rank else MPI.PROC_NULL
-        self._prev_rank = self._rank - 1 if self._rank - 1 >= self._first_rank else MPI.PROC_NULL
+        self._ce = comm_engine
         self._optimizer = optimizer
         self._loss_fn = loss_fn
         self._model = self._get_model(configs or {})
+        self._built = False
 
-    def _get_model(self, configs: Dict):
-        if self.is_first_node():
+    def _get_model(self, configs: Dict) -> tf.keras.Model:
+        if self._ce.model.is_first:
             return Input(configs.get('input_hidden_dims', [128]))
-        if self.is_last_node():
+        if self._ce.model.is_last:
             return Head(configs.get('dropout_rate', 0.2))
         return Block(configs.get('block_hidden_dims', [64, 64]))
 
     def _get_microbatches(self, batch):
-        assert batch_size % self._size == 0
-        microbatch_size = batch_size // self._size
+        assert batch_size % self._ce.model.size == 0
+        microbatch_size = batch_size // self._ce.model.size
         microbatches = tf.data.Dataset \
             .from_tensor_slices(batch) \
             .batch(microbatch_size)
         return microbatches
+
+    def _build(self, batch):
+        microbatches = self._get_microbatches(batch)
+        x = next(iter(microbatches))[0]
+        if self._ce.model.is_first:
+            y_pred = self._model(x)
+            self._ce.model.comm.send(y_pred, dest=self._ce.model.next_rank)
+        elif self._ce.model.is_last:
+            recvd = self._ce.model.comm.recv(source=self._ce.model.prev_rank)
+            self._model(recvd)
+        else:
+            recvd = self._ce.model.comm.recv(source=self._ce.model.prev_rank)
+            y_pred = self._model(recvd)
+            self._ce.model.comm.send(y_pred, dest=self._ce.model.next_rank)
+        weights = self._model.get_weights()
+        weights = self._ce.data.comm.bcast(weights)
+        self._model.set_weights(weights)
 
     def _forward(self, batch):
         microbatches = self._get_microbatches(batch)
@@ -136,96 +176,113 @@ class PipelineModel:
         for microbatch in microbatches:
             x, y_true = microbatch
             with tf.GradientTape() as tape:
-                if self.is_first_node():
+                if self._ce.model.is_first:
                     y_pred = self._model(x)
-                    self._data_comm.send(y_true, dest=self._last_rank)
-                    self._data_comm.send(y_pred, dest=self._next_rank)
-                elif self.is_last_node():
-                    y_true = self._data_comm.recv(source=self._first_rank)
-                    recvd = self._data_comm.recv(source=self._prev_rank)
+                    self._ce.model.comm.send(y_true, dest=self._ce.model.last_rank)
+                    self._ce.model.comm.send(y_pred, dest=self._ce.model.next_rank)
+                elif self._ce.model.is_last:
+                    y_true = self._ce.model.comm.recv(source=self._ce.model.first_rank)
+                    recvd = self._ce.model.comm.recv(source=self._ce.model.prev_rank)
                     y_pred = self._model(recvd)
                     loss = self._loss_fn(y_true, y_pred)
                     losses.append(loss)
                 else:
-                    recvd = self._data_comm.recv(source=self._prev_rank)
+                    recvd = self._ce.model.comm.recv(source=self._ce.model.prev_rank)
                     y_pred = self._model(recvd)
-                    self._data_comm.send(y_pred, dest=self._next_rank)
+                    self._ce.model.comm.send(y_pred, dest=self._ce.model.next_rank)
             predictions.append(y_pred)
             tapes.append(tape)
         return predictions, tapes, losses
 
     def _backward(self, predictions, tapes, losses):
         gradients = []
-        for i in range(self._size):
-            if self.is_first_node():
-                partial_error = self._data_comm.recv(source=self._next_rank)
+        for i in range(self._ce.model.size):
+            if self._ce.model.is_first:
+                partial_error = self._ce.model.comm.recv(source=self._ce.model.next_rank)
                 gradient = tapes[i].gradient(predictions[i],
                                              self._model.trainable_weights,
                                              output_gradients=partial_error)
-            elif self.is_last_node():
+            elif self._ce.model.is_last:
                 gradient = tapes[i].gradient(losses[i], self._model.trainable_weights)
-                self._data_comm.send(gradient[0], dest=self._prev_rank)
+                self._ce.model.comm.send(gradient[0], dest=self._ce.model.prev_rank)
             else:
-                partial_error = self._data_comm.recv(source=self._next_rank)
+                partial_error = self._ce.model.comm.recv(source=self._ce.model.next_rank)
                 gradient = tapes[i].gradient(predictions[i],
                                              self._model.trainable_weights,
                                              output_gradients=partial_error)
-                self._data_comm.send(gradient[0], dest=self._prev_rank)
+                self._ce.model.comm.send(gradient[0], dest=self._ce.model.prev_rank)
             gradients.append(gradient)
         gradients = list(map(list, zip(*gradients)))
         gradients = [tf.reduce_mean(gradient, axis=0) for gradient in gradients]
-
-        # TODO: Convert tensors to ndarrays
-        # TODO: Perform Allreduce operation on gradients
-        # TODO: Convert ndarrays back to tensors
-
+        gradients = [self._ce.data.comm.allreduce(gradient, op=MPI.SUM) for gradient in gradients]
         self._optimizer.apply_gradients(zip(gradients, self._model.trainable_weights))
 
     def train_on_batch(self, batch):
+        if not self._built:
+            self._build(batch)
+            self._built = True
         predictions, tapes, losses = self._forward(batch)
         self._backward(predictions, tapes, losses)
-        loss = tf.reduce_mean(losses)
+        if self._ce.model.is_last:
+            loss = self._ce.data.comm.reduce(tf.reduce_mean(losses), op=MPI.SUM, root=self._ce.data.last_rank)
+            if self._ce.data.is_last:
+                loss /= self._ce.data.size
+        else:
+            loss = None
         return loss
 
     def predict_on_batch(self, x):
+        if not self._built:
+            raise RuntimeError('The model has not been built yet.')
         microbatches = self._get_microbatches(x)
         predictions = []
         for x in microbatches:
-            if self.is_first_node():
+            if self._ce.model.is_first:
                 y_pred = self._model(x)
-                self._data_comm.send(y_pred, dest=self._next_rank)
-            elif self.is_last_node():
-                recvd = self._data_comm.recv(source=self._prev_rank)
+                self._ce.model.comm.send(y_pred, dest=self._ce.model.next_rank)
+            elif self._ce.model.is_last:
+                recvd = self._ce.model.comm.recv(source=self._ce.model.prev_rank)
                 y_pred = self._model(recvd)
             else:
-                recvd = self._data_comm.recv(source=self._prev_rank)
+                recvd = self._ce.model.comm.recv(source=self._ce.model.prev_rank)
                 y_pred = self._model(recvd)
-                self._data_comm.send(y_pred, dest=self._next_rank)
+                self._ce.model.comm.send(y_pred, dest=self._ce.model.next_rank)
             predictions.extend(y_pred.numpy())
+        if self._ce.model.is_last:
+            predictions = self._ce.data.comm.gather(predictions, root=self._ce.data.last_rank)
+        else:
+            predictions = []
         return predictions
 
-    def is_first_node(self) -> bool:
-        return self._rank == self._first_rank
 
-    def is_last_node(self) -> bool:
-        return self._rank == self._last_rank
+def get_distributed_data(comm, x_train: Sequence, y_train: Sequence, x_test: Sequence, y_test: Sequence) -> Tuple:
+    rank = comm.Get_rank()
+    size = comm.Get_size()
 
-    @staticmethod
-    def is_coordinator() -> bool:
-        return MPI.COMM_WORLD.Get_rank() == 0
+    n_train, n_test = len(x_train), len(x_test)
+    n_train_per_proc = n_train // size
+    n_test_per_proc = n_test // size
+    x_train = x_train[rank * n_train_per_proc:(rank + 1) * n_train_per_proc, :, :]
+    y_train = y_train[rank * n_train_per_proc:(rank + 1) * n_train_per_proc]
+
+    if rank == size - 1:
+        x_test = x_test[rank * n_test_per_proc:, :, :]
+        y_test = y_test[rank * n_test_per_proc:]
+    else:
+        x_test = x_test[rank * n_test_per_proc:(rank + 1) * n_test_per_proc, :, :]
+        y_test = y_test[rank * n_test_per_proc:(rank + 1) * n_test_per_proc]
+
+    return x_train, y_train, x_test, y_test
 
 
 def main():
-    model_comm, data_comm, nkmpi_comm = split_comm(MPI.COMM_WORLD,
-                                                   model_parallel_size=4,
-                                                   data_parallel_dims=[2, 2])
+    comm_engine = CommEngine(MPI.COMM_WORLD, model_size=4, data_dims=[2, 2, 2])
 
     (x_train, y_train), (x_test, y_test) = tf.keras.datasets.mnist.load_data()
     x_train, x_test = x_train / 255.0, x_test / 255.0
+    x_train, y_train, x_test, y_test = get_distributed_data(comm_engine.data.comm, x_train, y_train, x_test, y_test)
     n_train, n_test = len(x_train), len(x_test)
     n_train_batch, n_test_batch = math.floor(n_train / batch_size), math.ceil(n_test / batch_size)
-
-    # TODO: Split dataset
 
     x_train = tf.data.Dataset \
         .from_tensor_slices((x_train, y_train)) \
@@ -238,45 +295,32 @@ def main():
     optimizer = tf.keras.optimizers.Adam()
     loss_fn = tf.keras.losses.SparseCategoricalCrossentropy()
     accuracy = tf.keras.metrics.SparseCategoricalAccuracy()
-    model = PipelineModel(model_comm, nkmpi_comm, optimizer, loss_fn)
+    model = HyParModel(comm_engine, optimizer, loss_fn)
 
-    # TODO: Broadcast initial variable states from rank 0 to all other processes
-
-    if model.is_coordinator():
+    if comm_engine.is_coordinator:
         print('Training')
     for i in range(max_epoch):
-        if model.is_coordinator():
+        if comm_engine.is_coordinator:
             print(f'Epoch {i + 1}/{max_epoch}')
             progbar = tf.keras.utils.Progbar(n_train_batch, stateful_metrics=['loss'])
         for batch in x_train:
             loss = model.train_on_batch(batch)
-            if model.is_coordinator():
+            if comm_engine.is_coordinator:
                 # noinspection PyUnboundLocalVariable
                 progbar.add(1, values=[('loss', loss)])
 
-    if model.is_coordinator():
+    if comm_engine.is_coordinator:
         print('Testing')
         progbar = tf.keras.utils.Progbar(n_test_batch, stateful_metrics=['acc'])
     for batch in x_test:
         x, y_true = batch
         y_pred = model.predict_on_batch(x)
-        accuracy.update_state(y_true, y_pred)
-        if model.is_coordinator():
+        if comm_engine.model.is_last:
+            y_true = comm_engine.data.comm.gather(y_true, root=comm_engine.data.last_rank)
+        if comm_engine.is_coordinator:
+            accuracy.update_state(y_true, y_pred)
             # noinspection PyUnboundLocalVariable
             progbar.add(1, values=[('acc', accuracy.result())])
-
-
-def split_comm(comm, model_parallel_size: int, data_parallel_dims: Sequence):
-    size = comm.Get_size()
-    cart2d = comm.Create_cart(dims=[model_parallel_size, size // model_parallel_size],
-                              periods=[False, False],
-                              reorder=False)
-    remain_dims = [True, False]
-    model_comm = cart2d.Sub(remain_dims)
-    remain_dims = [False, True]
-    data_comm = cart2d.Sub(remain_dims)
-    nkmpi_comm = NKMPI.Comm(data_comm, new_dims=data_parallel_dims)
-    return model_comm, data_comm, nkmpi_comm
 
 
 if __name__ == '__main__':

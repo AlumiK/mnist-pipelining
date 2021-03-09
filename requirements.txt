@@ -1,3 +1,4 @@
 tensorflow
 mpi4py
+numpy
 git+https://github.com/AlumiK/nkmpi4py.git
