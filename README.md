@@ -9,7 +9,7 @@ This version is implemented with TensorFlow 2 and MPI.
 Run the code with
 
 ```
-$ mpirun -np 4 python main.py
+$ mpirun -np 32 python hybrid_parallelism.py
 ```
 
-`4` is the number of processes.
+`32` is the number of processes.
