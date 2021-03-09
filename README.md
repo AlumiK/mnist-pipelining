@@ -9,6 +9,7 @@ This version is implemented with TensorFlow 2 and MPI.
 Run the code with
 
 ```
-# 4 is the number of processes
-mpirun -np 4 python main.py
+$ mpirun -np 4 python main.py
 ```
+
+`4` is the number of processes.
