@@ -1,6 +1,8 @@
-# MNIST Model Parallelism Using Pipelining
+# MNIST Hybrid Parallelism
 
-MNIST model parallelism using pipelining implemented with TensorFlow 2 and MPI.
+MNIST hybrid parallelism using pipelining and hierarchical Allreduce.
+
+This version is implemented with TensorFlow 2 and MPI.
 
 ## Run
 
