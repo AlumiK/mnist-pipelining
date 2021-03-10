@@ -3,10 +3,10 @@ import tensorflow as tf
 
 from mpi4py import MPI
 from nkmpi4py import NKMPI
-from typing import Sequence, Tuple, Dict, Optional
+from typing import Sequence, Tuple, Dict, Any, Optional
 
 batch_size = 64
-max_epoch = 10
+epochs = 10
 
 
 # noinspection PyUnusedLocal
@@ -55,7 +55,7 @@ class Input(tf.keras.Model):
 
 class Block(tf.keras.Model):
 
-    def __init__(self, hidden_dims):
+    def __init__(self, hidden_dims: Sequence):
         super().__init__()
         self._hidden_dims = hidden_dims
         self.grad_layer = GradLayer()
@@ -96,7 +96,7 @@ class Head(tf.keras.Model):
 
 
 class CommEngine:
-    class Entry:
+    class Comm:
 
         def __init__(self, comm):
             self.comm = comm
@@ -110,23 +110,15 @@ class CommEngine:
             self.is_last: bool = self.rank == self.last_rank
 
     def __init__(self, comm, model_size: int, data_dims: Sequence):
-        size = comm.Get_size()
-        cart2d = comm.Create_cart(dims=[model_size, size // model_size], periods=[False, False], reorder=False)
-        remain_dims = [True, False]
-        model_comm = cart2d.Sub(remain_dims)
-        remain_dims = [False, True]
-        data_comm = cart2d.Sub(remain_dims)
+        self.world = CommEngine.Comm(comm)
+        assert self.world.size % model_size == 0
+        cart_comm = comm.Create_cart(dims=[model_size, self.world.size // model_size],
+                                     periods=[False, False],
+                                     reorder=False)
+        model_comm, data_comm = cart_comm.Sub([True, False]), cart_comm.Sub([False, True])
         data_comm = NKMPI.Comm(data_comm, new_dims=data_dims)
-        self.model = CommEngine.Entry(model_comm)
-        self.data = CommEngine.Entry(data_comm)
-
-    @property
-    def is_coordinator(self) -> bool:
-        return MPI.COMM_WORLD.Get_rank() == MPI.COMM_WORLD.Get_size() - 1
-
-    @property
-    def is_dispatcher(self) -> bool:
-        return MPI.COMM_WORLD.Get_rank() == 0
+        self.model = CommEngine.Comm(model_comm)
+        self.data = CommEngine.Comm(data_comm)
 
 
 class HyParModel:
@@ -142,14 +134,14 @@ class HyParModel:
         self._model = self._get_model(configs or {})
         self._built = False
 
-    def _get_model(self, configs: Dict) -> tf.keras.Model:
+    def _get_model(self, configs: Dict[str, Any]) -> tf.keras.Model:
         if self._ce.model.is_first:
             return Input(configs.get('input_hidden_dims', [128]))
         if self._ce.model.is_last:
             return Head(configs.get('dropout_rate', 0.2))
         return Block(configs.get('block_hidden_dims', [64, 64]))
 
-    def _get_microbatches(self, batch):
+    def _get_microbatches(self, batch) -> tf.data.Dataset:
         assert batch_size % self._ce.model.size == 0
         microbatch_size = batch_size // self._ce.model.size
         microbatches = tf.data.Dataset \
@@ -170,18 +162,21 @@ class HyParModel:
             recvd = self._ce.model.comm.recv(source=self._ce.model.prev_rank)
             y_pred = self._model(recvd)
             self._ce.model.comm.send(y_pred, dest=self._ce.model.next_rank)
-        weights = self._model.get_weights()
+        weights = None
+        if self._ce.data.is_first:
+            weights = self._model.get_weights()
         weights = self._ce.data.comm.bcast(weights)
         self._model.set_weights(weights)
+        self._built = True
 
     # noinspection PyUnboundLocalVariable
-    def _forward(self, batch):
+    def _forward(self, batch) -> Tuple[Sequence, ...]:
         if self._ce.model.is_first:
-            microbatches = iter(self._get_microbatches(batch))
+            microbatches_iter = iter(self._get_microbatches(batch))
         predictions, tapes, losses = [], [], []
         for _ in range(self._ce.model.size):
             if self._ce.model.is_first:
-                x, y_true = next(microbatches)
+                x, y_true = next(microbatches_iter)
             with tf.GradientTape() as tape:
                 if self._ce.model.is_first:
                     y_pred = self._model(x)
@@ -201,7 +196,7 @@ class HyParModel:
             tapes.append(tape)
         return predictions, tapes, losses
 
-    def _backward(self, predictions, tapes, losses):
+    def _backward(self, predictions: Sequence, tapes: Sequence, losses: Sequence):
         gradients = []
         for i in range(self._ce.model.size):
             if self._ce.model.is_first:
@@ -224,22 +219,20 @@ class HyParModel:
         gradients = [self._ce.data.comm.allreduce(gradient, op=MPI.SUM) for gradient in gradients]
         self._optimizer.apply_gradients(zip(gradients, self._model.trainable_weights))
 
-    def train_on_batch(self, batch):
+    def train_on_batch(self, batch) -> Optional[float]:
         if not self._built:
             self._build(batch)
-            self._built = True
         predictions, tapes, losses = self._forward(batch)
         self._backward(predictions, tapes, losses)
+        loss = None
         if self._ce.model.is_last:
             loss = self._ce.data.comm.reduce(tf.reduce_mean(losses), op=MPI.SUM, root=self._ce.data.last_rank)
-            if self._ce.data.is_last:
+            if self._ce.world.is_last:
                 loss /= self._ce.data.size
-        else:
-            loss = None
         return loss
 
     # noinspection PyUnboundLocalVariable
-    def predict_on_batch(self, x):
+    def predict_on_batch(self, x) -> Sequence:
         if not self._built:
             raise RuntimeError('The model has not been built yet.')
         n_microbatch = None
@@ -269,43 +262,36 @@ class HyParModel:
         return predictions
 
 
-def get_distributed_data(comm_engine: CommEngine) -> Tuple:
+def dispatch_data(comm_engine: CommEngine) -> Tuple[Sequence, ...]:
     sendobj = []
-    if comm_engine.is_dispatcher:
+    if comm_engine.world.is_first:
         (x_train, y_train), (x_test, y_test) = tf.keras.datasets.mnist.load_data()
         x_train, x_test = x_train / 255.0, x_test / 255.0
         n_train, n_test = len(x_train), len(x_test)
-        n_train_per_proc = n_train // comm_engine.data.size
-        n_test_per_proc = n_test // comm_engine.data.size
+        n_train_proc, n_test_proc = n_train // comm_engine.data.size, n_test // comm_engine.data.size
         for i in range(comm_engine.data.size):
-            data_proc = []
-            x_train_proc = x_train[i * n_train_per_proc:(i + 1) * n_train_per_proc, :, :]
-            y_train_proc = y_train[i * n_train_per_proc:(i + 1) * n_train_per_proc]
-
+            x_train_proc = x_train[i * n_train_proc:(i + 1) * n_train_proc, :, :]
+            y_train_proc = y_train[i * n_train_proc:(i + 1) * n_train_proc]
             if i == comm_engine.data.last_rank:
-                x_test_proc = x_test[i * n_test_per_proc:, :, :]
-                y_test_proc = y_test[i * n_test_per_proc:]
+                x_test_proc = x_test[i * n_test_proc:, :, :]
+                y_test_proc = y_test[i * n_test_proc:]
             else:
-                x_test_proc = x_test[i * n_test_per_proc:(i + 1) * n_test_per_proc, :, :]
-                y_test_proc = y_test[i * n_test_per_proc:(i + 1) * n_test_per_proc]
-            data_proc.append(x_train_proc)
-            data_proc.append(y_train_proc)
-            data_proc.append(x_test_proc)
-            data_proc.append(y_test_proc)
-            sendobj.append(data_proc)
+                x_test_proc = x_test[i * n_test_proc:(i + 1) * n_test_proc, :, :]
+                y_test_proc = y_test[i * n_test_proc:(i + 1) * n_test_proc]
+            sendobj.append([x_train_proc, y_train_proc, x_test_proc, y_test_proc])
     x_train, y_train, x_test, y_test = comm_engine.data.comm.scatter(sendobj)
     return x_train, y_train, x_test, y_test
 
 
 # noinspection PyUnboundLocalVariable
 def main():
-    comm_engine = CommEngine(MPI.COMM_WORLD, model_size=4, data_dims=[2, 2, 2])
+    ce = CommEngine(MPI.COMM_WORLD, model_size=4, data_dims=[2, 2, 2])
+
     n_train_batch, n_test_batch = None, None
-    if comm_engine.model.is_first:
-        x_train, y_train, x_test, y_test = get_distributed_data(comm_engine)
+    if ce.model.is_first:
+        x_train, y_train, x_test, y_test = dispatch_data(ce)
         n_train, n_test = len(x_train), len(x_test)
         n_train_batch, n_test_batch = math.floor(n_train / batch_size), math.ceil(n_test / batch_size)
-
         x_train = tf.data.Dataset \
             .from_tensor_slices((x_train, y_train)) \
             .batch(batch_size, drop_remainder=True) \
@@ -313,44 +299,42 @@ def main():
         x_test = tf.data.Dataset \
             .from_tensor_slices((x_test, y_test)) \
             .batch(batch_size)
-    n_train_batch, n_test_batch = comm_engine.model.comm.bcast((n_train_batch, n_test_batch))
+    n_train_batch, n_test_batch = ce.model.comm.bcast((n_train_batch, n_test_batch))
 
     optimizer = tf.keras.optimizers.Adam()
     loss_fn = tf.keras.losses.SparseCategoricalCrossentropy()
     accuracy = tf.keras.metrics.SparseCategoricalAccuracy()
-    model = HyParModel(comm_engine, optimizer, loss_fn)
+    model = HyParModel(comm_engine=ce, optimizer=optimizer, loss_fn=loss_fn)
 
-    if comm_engine.is_coordinator:
+    if ce.world.is_last:
         print('Training')
-    for i in range(max_epoch):
-        if comm_engine.is_coordinator:
-            print(f'Epoch {i + 1}/{max_epoch}')
+    for i in range(epochs):
+        if ce.world.is_last:
+            print(f'Epoch {i + 1}/{epochs}')
             progbar = tf.keras.utils.Progbar(n_train_batch, stateful_metrics=['loss'])
-        if comm_engine.model.is_first:
+        if ce.model.is_first:
             x_train_iter = iter(x_train)
         for _ in range(n_train_batch):
-            batch = next(x_train_iter) if comm_engine.model.is_first else None
+            batch = next(x_train_iter) if ce.model.is_first else None
             loss = model.train_on_batch(batch)
-            if comm_engine.is_coordinator:
-                # noinspection PyUnboundLocalVariable
+            if ce.world.is_last:
                 progbar.add(1, values=[('loss', loss)])
 
-    if comm_engine.is_coordinator:
+    if ce.world.is_last:
         print('Testing')
         progbar = tf.keras.utils.Progbar(n_test_batch, stateful_metrics=['acc'])
-    if comm_engine.model.is_first:
+    if ce.model.is_first:
         x_test_iter = iter(x_test)
     for _ in range(n_test_batch):
-        x, y_true = next(x_test_iter) if comm_engine.model.is_first else (None, None)
+        x, y_true = next(x_test_iter) if ce.model.is_first else (None, None)
         y_pred = model.predict_on_batch(x)
-        if comm_engine.model.is_first:
-            comm_engine.model.comm.send(y_true, dest=comm_engine.model.last_rank)
-        if comm_engine.model.is_last:
-            y_true = comm_engine.model.comm.recv(source=comm_engine.model.first_rank)
-            y_true = comm_engine.data.comm.gather(y_true, root=comm_engine.data.last_rank)
-        if comm_engine.is_coordinator:
+        if ce.model.is_first:
+            ce.model.comm.send(y_true, dest=ce.model.last_rank)
+        if ce.model.is_last:
+            y_true = ce.model.comm.recv(source=ce.model.first_rank)
+            y_true = ce.data.comm.gather(y_true, root=ce.data.last_rank)
+        if ce.world.is_last:
             accuracy.update_state(y_true, y_pred)
-            # noinspection PyUnboundLocalVariable
             progbar.add(1, values=[('acc', accuracy.result())])
 
 

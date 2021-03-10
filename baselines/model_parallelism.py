@@ -5,7 +5,7 @@ from mpi4py import MPI
 from typing import Sequence, Dict, Optional
 
 batch_size = 64
-max_epoch = 10
+epochs = 10
 
 
 # noinspection PyUnusedLocal
@@ -225,9 +225,9 @@ def main():
 
     if model.is_last_node():
         print('Training')
-    for i in range(max_epoch):
+    for i in range(epochs):
         if model.is_last_node():
-            print(f'Epoch {i + 1}/{max_epoch}')
+            print(f'Epoch {i + 1}/{epochs}')
             progbar = tf.keras.utils.Progbar(n_train_batch, stateful_metrics=['loss'])
         for batch in x_train:
             loss = model.train_on_batch(batch)
