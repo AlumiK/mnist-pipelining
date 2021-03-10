@@ -5,7 +5,7 @@ from mpi4py import MPI
 from typing import Sequence, Dict, Optional
 
 batch_size = 64
-max_epoch = 5
+max_epoch = 10
 
 
 # noinspection PyUnusedLocal

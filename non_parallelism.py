@@ -1,7 +1,7 @@
 import tensorflow as tf
 
 batch_size = 64
-max_epoch = 5
+max_epoch = 10
 
 (x_train, y_train), (x_test, y_test) = tf.keras.datasets.mnist.load_data()
 x_train, x_test = x_train / 255.0, x_test / 255.0
