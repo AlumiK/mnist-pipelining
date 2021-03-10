@@ -124,6 +124,10 @@ class CommEngine:
     def is_coordinator(self) -> bool:
         return MPI.COMM_WORLD.Get_rank() == MPI.COMM_WORLD.Get_size() - 1
 
+    @property
+    def is_dispatcher(self) -> bool:
+        return MPI.COMM_WORLD.Get_rank() == 0
+
 
 class HyParModel:
 
@@ -154,9 +158,9 @@ class HyParModel:
         return microbatches
 
     def _build(self, batch):
-        microbatches = self._get_microbatches(batch)
-        x = next(iter(microbatches))[0]
         if self._ce.model.is_first:
+            microbatches = self._get_microbatches(batch)
+            x = next(iter(microbatches))[0]
             y_pred = self._model(x)
             self._ce.model.comm.send(y_pred, dest=self._ce.model.next_rank)
         elif self._ce.model.is_last:
@@ -170,11 +174,14 @@ class HyParModel:
         weights = self._ce.data.comm.bcast(weights)
         self._model.set_weights(weights)
 
+    # noinspection PyUnboundLocalVariable
     def _forward(self, batch):
-        microbatches = self._get_microbatches(batch)
+        if self._ce.model.is_first:
+            microbatches = iter(self._get_microbatches(batch))
         predictions, tapes, losses = [], [], []
-        for microbatch in microbatches:
-            x, y_true = microbatch
+        for _ in range(self._ce.model.size):
+            if self._ce.model.is_first:
+                x, y_true = next(microbatches)
             with tf.GradientTape() as tape:
                 if self._ce.model.is_first:
                     y_pred = self._model(x)
@@ -231,13 +238,20 @@ class HyParModel:
             loss = None
         return loss
 
+    # noinspection PyUnboundLocalVariable
     def predict_on_batch(self, x):
         if not self._built:
             raise RuntimeError('The model has not been built yet.')
-        microbatches = self._get_microbatches(x)
+        n_microbatch = None
+        if self._ce.model.is_first:
+            microbatches = self._get_microbatches(x)
+            microbatches_iter = iter(microbatches)
+            n_microbatch = microbatches.cardinality().numpy()
+        n_microbatch = self._ce.model.comm.bcast(n_microbatch)
         predictions = []
-        for x in microbatches:
+        for _ in range(n_microbatch):
             if self._ce.model.is_first:
+                x = next(microbatches_iter)
                 y_pred = self._model(x)
                 self._ce.model.comm.send(y_pred, dest=self._ce.model.next_rank)
             elif self._ce.model.is_last:
@@ -255,42 +269,51 @@ class HyParModel:
         return predictions
 
 
-def get_distributed_data(comm, x_train: Sequence, y_train: Sequence, x_test: Sequence, y_test: Sequence) -> Tuple:
-    rank = comm.Get_rank()
-    size = comm.Get_size()
+def get_distributed_data(comm_engine: CommEngine) -> Tuple:
+    sendobj = []
+    if comm_engine.is_dispatcher:
+        (x_train, y_train), (x_test, y_test) = tf.keras.datasets.mnist.load_data()
+        x_train, x_test = x_train / 255.0, x_test / 255.0
+        n_train, n_test = len(x_train), len(x_test)
+        n_train_per_proc = n_train // comm_engine.data.size
+        n_test_per_proc = n_test // comm_engine.data.size
+        for i in range(comm_engine.data.size):
+            data_proc = []
+            x_train_proc = x_train[i * n_train_per_proc:(i + 1) * n_train_per_proc, :, :]
+            y_train_proc = y_train[i * n_train_per_proc:(i + 1) * n_train_per_proc]
 
-    n_train, n_test = len(x_train), len(x_test)
-    n_train_per_proc = n_train // size
-    n_test_per_proc = n_test // size
-    x_train = x_train[rank * n_train_per_proc:(rank + 1) * n_train_per_proc, :, :]
-    y_train = y_train[rank * n_train_per_proc:(rank + 1) * n_train_per_proc]
-
-    if rank == size - 1:
-        x_test = x_test[rank * n_test_per_proc:, :, :]
-        y_test = y_test[rank * n_test_per_proc:]
-    else:
-        x_test = x_test[rank * n_test_per_proc:(rank + 1) * n_test_per_proc, :, :]
-        y_test = y_test[rank * n_test_per_proc:(rank + 1) * n_test_per_proc]
-
+            if i == comm_engine.data.last_rank:
+                x_test_proc = x_test[i * n_test_per_proc:, :, :]
+                y_test_proc = y_test[i * n_test_per_proc:]
+            else:
+                x_test_proc = x_test[i * n_test_per_proc:(i + 1) * n_test_per_proc, :, :]
+                y_test_proc = y_test[i * n_test_per_proc:(i + 1) * n_test_per_proc]
+            data_proc.append(x_train_proc)
+            data_proc.append(y_train_proc)
+            data_proc.append(x_test_proc)
+            data_proc.append(y_test_proc)
+            sendobj.append(data_proc)
+    x_train, y_train, x_test, y_test = comm_engine.data.comm.scatter(sendobj)
     return x_train, y_train, x_test, y_test
 
 
+# noinspection PyUnboundLocalVariable
 def main():
     comm_engine = CommEngine(MPI.COMM_WORLD, model_size=4, data_dims=[2, 2, 2])
+    n_train_batch, n_test_batch = None, None
+    if comm_engine.model.is_first:
+        x_train, y_train, x_test, y_test = get_distributed_data(comm_engine)
+        n_train, n_test = len(x_train), len(x_test)
+        n_train_batch, n_test_batch = math.floor(n_train / batch_size), math.ceil(n_test / batch_size)
 
-    (x_train, y_train), (x_test, y_test) = tf.keras.datasets.mnist.load_data()
-    x_train, x_test = x_train / 255.0, x_test / 255.0
-    x_train, y_train, x_test, y_test = get_distributed_data(comm_engine.data.comm, x_train, y_train, x_test, y_test)
-    n_train, n_test = len(x_train), len(x_test)
-    n_train_batch, n_test_batch = math.floor(n_train / batch_size), math.ceil(n_test / batch_size)
-
-    x_train = tf.data.Dataset \
-        .from_tensor_slices((x_train, y_train)) \
-        .batch(batch_size, drop_remainder=True) \
-        .shuffle(n_train)
-    x_test = tf.data.Dataset \
-        .from_tensor_slices((x_test, y_test)) \
-        .batch(batch_size)
+        x_train = tf.data.Dataset \
+            .from_tensor_slices((x_train, y_train)) \
+            .batch(batch_size, drop_remainder=True) \
+            .shuffle(n_train)
+        x_test = tf.data.Dataset \
+            .from_tensor_slices((x_test, y_test)) \
+            .batch(batch_size)
+    n_train_batch, n_test_batch = comm_engine.model.comm.bcast((n_train_batch, n_test_batch))
 
     optimizer = tf.keras.optimizers.Adam()
     loss_fn = tf.keras.losses.SparseCategoricalCrossentropy()
@@ -303,7 +326,10 @@ def main():
         if comm_engine.is_coordinator:
             print(f'Epoch {i + 1}/{max_epoch}')
             progbar = tf.keras.utils.Progbar(n_train_batch, stateful_metrics=['loss'])
-        for batch in x_train:
+        if comm_engine.model.is_first:
+            x_train_iter = iter(x_train)
+        for _ in range(n_train_batch):
+            batch = next(x_train_iter) if comm_engine.model.is_first else None
             loss = model.train_on_batch(batch)
             if comm_engine.is_coordinator:
                 # noinspection PyUnboundLocalVariable
@@ -312,10 +338,15 @@ def main():
     if comm_engine.is_coordinator:
         print('Testing')
         progbar = tf.keras.utils.Progbar(n_test_batch, stateful_metrics=['acc'])
-    for batch in x_test:
-        x, y_true = batch
+    if comm_engine.model.is_first:
+        x_test_iter = iter(x_test)
+    for _ in range(n_test_batch):
+        x, y_true = next(x_test_iter) if comm_engine.model.is_first else (None, None)
         y_pred = model.predict_on_batch(x)
+        if comm_engine.model.is_first:
+            comm_engine.model.comm.send(y_true, dest=comm_engine.model.last_rank)
         if comm_engine.model.is_last:
+            y_true = comm_engine.model.comm.recv(source=comm_engine.model.first_rank)
             y_true = comm_engine.data.comm.gather(y_true, root=comm_engine.data.last_rank)
         if comm_engine.is_coordinator:
             accuracy.update_state(y_true, y_pred)
