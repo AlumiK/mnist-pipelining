@@ -1,21 +1,31 @@
-# MNIST Hybrid Parallelism
+# Hybrid Parallelism
 
-MNIST hybrid parallelism using pipelining and hierarchical Allreduce.
+TensorFlow 2 hybrid parallelism using pipelining and hierarchical Allreduce.
 
-This version is implemented with TensorFlow 2 and MPI.
+MPI is used as the communication runtime.
 
 ## Run
 
-Run the code with
+Install dependencies by
 
 ```
-$ mpirun -np 16 python hybrid_parallelism.py
+$ pip install -r requirements.txt
+```
+
+Then run the script by
+
+```
+$ mpirun -n 16 python main.py
 ```
 
 `16` is the number of processes.
 
-## Model Structure
+## Distributed Model
 
 The script uses 4-way model parallelism and 4-way data parallelism by default.
 
 ![model structure](https://raw.githubusercontent.com/AlumiK/images/main/hybrid-parallelism/model_structure.svg)
+
+A brief flowchart of the distributed training process is shown below.
+
+![flowchart](https://raw.githubusercontent.com/AlumiK/images/main/hybrid-parallelism/flowchart.svg)
