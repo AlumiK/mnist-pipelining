@@ -285,7 +285,7 @@ def dispatch_data(comm_engine: CommEngine) -> Tuple[Sequence, ...]:
 
 # noinspection PyUnboundLocalVariable
 def main():
-    ce = CommEngine(MPI.COMM_WORLD, model_size=4, data_dims=[2, 2, 2])
+    ce = CommEngine(MPI.COMM_WORLD, model_size=4, data_dims=[2, 2])
 
     n_train_batch, n_test_batch = None, None
     if ce.model.is_first:
